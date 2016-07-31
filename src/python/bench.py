@@ -425,6 +425,67 @@ def run_wiki_1k_schema_bench(start, tgz, runLogDir, perfFile, gcFile):
     finally:
         server.stop()
         time.sleep(5)
+#Same as run_wiki_1k_schema_bench but with overwrite=false 
+#TODO refactor
+def run_wiki_1k_overwrite_bench(start, tgz, runLogDir, perfFile, gcFile):
+    # we start in schemaless mode but use the schema api to add the right fields
+    jmx_args = ' '.join(['-Dcom.sun.management.jmxremote',
+                         '-Dcom.sun.management.jmxremote.port=9999',
+                         '-Dcom.sun.management.jmxremote.authenticate=false',
+                         '-Dcom.sun.management.jmxremote.ssl=false'])
+    server = SolrServer(tgz, '%s/wiki-1k-schema' % constants.BENCH_DIR, example='schemaless', memory='4g', jvm_args=jmx_args)
+    server.extract(runLogDir)
+    try:
+        bench = JavaBench(os.getcwd())
+        bench.compile(server, runLogDir)
+
+        server.start(runLogDir)
+        time.sleep(5)
+
+        solrMajorVersion, solrImplVersion = server.get_version()
+
+        solrUrl = 'http://%s:%s/solr/gettingstarted' % (server.host, server.port)
+
+        utils.info('Updating schema')
+        schemaApiUrl = '%s/schema' % solrUrl
+        r = requests.post(schemaApiUrl,
+                          data='{"add-field":{"name":"title","type":"string","stored":false, "indexed":true },'
+                               '"add-field":{"name":"titleTokenized","type":"text_en","stored":true, "indexed":true },'
+                               '"add-field":{"name":"body","type":"text_en","stored":false, "indexed":true },'
+                               '"add-field":{"name":"date","type":"date","stored":true, "indexed":true },'
+                               '"add-field":{"name":"timesecnum","type":"tint","stored":false, "indexed":true },'
+                               '"add-copy-field":{"source":"title","dest":[ "titleTokenized"]},'
+                               '"delete-copy-field":{ "source":"*", "dest":"_text_"}}')
+        print r.json()
+
+        logFile = '%s/wiki-1k-schema-overwrite.log.txt' % runLogDir
+
+        bytesIndexed, indexTimeSec, docsIndexed, times, garbage, peak = bench.run('wiki-1k-schema', server,
+                                                            'org.apache.solr.perf.WikiIndexer',
+                                                            [
+                                                                # '-useHttpSolrClient', '-solrUrl', solrUrl,
+                                                                '-useConcurrentUpdateSolrClient', '-solrUrl', solrUrl,
+                                                                '-lineDocsFile', constants.WIKI_1K_DATA_FILE,
+                                                                '-docCountLimit', '-1',
+                                                                '-threadCount', '9',
+                                                                '-batchSize', '100',
+                                                                'overwrite', 'false'], logFile)
+
+        if docsIndexed != constants.WIKI_1K_NUM_DOCS:
+            raise RuntimeError(
+                    'Indexed num_docs do not match expected %d != found %d' % (constants.WIKI_1K_NUM_DOCS, docsIndexed))
+        timeStampLoggable = '%04d-%02d-%02d %02d:%02d:%02d' % (
+            start.year, start.month, start.day, start.hour, start.minute, start.second)
+        if not NOREPORT:
+            with open(perfFile, 'a+') as f:
+                f.write('%s,%d,%d,%.1f,%s,%s\n' % (
+                    timeStampLoggable, bytesIndexed, docsIndexed, indexTimeSec, solrMajorVersion, solrImplVersion))
+
+            write_gc_file(gcFile, timeStampLoggable, solrMajorVersion, solrImplVersion, times, garbage, peak)
+        return bytesIndexed, indexTimeSec, docsIndexed, times, garbage, peak
+    finally:
+        server.stop()
+        time.sleep(5)
 
 def run_wiki_4k_schema_bench(start, tgz, runLogDir, perfFile, gcFile):
     # we start in schemaless mode but use the schema api to add the right fields
@@ -688,6 +749,36 @@ def main():
 
     wiki1kSchemaIndexDocsSecChartData.sort()
     wiki1kSchemaIndexDocsSecChartData.insert(0, 'Date,K docs/sec')
+
+
+    wiki1kSchemaPerfFile = '%s/wiki_1k_schema_overwrite.perfdata.txt' % constants.LOG_BASE_DIR
+    wiki1kSchemaGcFile = '%s/wiki_1k_schema_overwrite.gc.txt' % constants.LOG_BASE_DIR
+    wiki1kBytesIndexed, wiki1kIndexTimeSec, wiki1kDocsIndexed, \
+    wiki1kTimes, wiki1kGarbage, wiki1kPeak = run_wiki_1k_schema_bench(start, tgz, runLogDir, wiki1kSchemaPerfFile, wiki1kSchemaGcFile)
+    wiki1kSchemaIndexChartData = []
+    wiki1kSchemaIndexDocsSecChartData = []
+    wiki1kSchemaGcTimesChartData = []
+    wiki1kSchemaGcGarbageChartData = []
+    wiki1kSchemaGcPeakChartData = []
+    populate_gc_data(wiki1kSchemaGcFile, wiki1kSchemaGcGarbageChartData, wiki1kSchemaGcPeakChartData,
+                     wiki1kSchemaGcTimesChartData)
+    with open(wiki1kSchemaPerfFile, 'r') as f:
+        lines = [line.rstrip('\n') for line in f]
+        for l in lines:
+            timeStamp, bytesIndexed, docsIndexed, timeTaken, solrMajorVersion, solrImplVersion = l.split(',')
+            implVersion = solrImplVersion
+            wiki1kSchemaIndexChartData.append(
+                    '%s,%.1f' % (timeStamp, (int(bytesIndexed) / (1024 * 1024 * 1024.)) / (float(timeTaken) / 3600.)))
+            wiki1kSchemaIndexDocsSecChartData.append('%s,%.1f' % (timeStamp, (int(docsIndexed) / 1000) / float(timeTaken)))
+
+    wiki1kSchemaIndexChartData.sort()
+    wiki1kSchemaIndexChartData.insert(0, 'Date,GB/hour')
+
+    wiki1kSchemaIndexDocsSecChartData.sort()
+    wiki1kSchemaIndexDocsSecChartData.insert(0, 'Date,K docs/sec')
+
+
+
 
     wiki4kSchemaPerfFile = '%s/wiki_4k_schema.perfdata.txt' % constants.LOG_BASE_DIR
     wiki4kGcFile = '%s/wiki_4k_schema.gc.txt' % constants.LOG_BASE_DIR

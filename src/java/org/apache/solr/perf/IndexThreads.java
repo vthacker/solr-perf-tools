@@ -17,14 +17,21 @@ package org.apache.solr.perf;
  * limitations under the License.
  */
 
+import org.apache.http.NoHttpResponseException;
+import org.apache.http.conn.ConnectTimeoutException;
 import org.apache.solr.client.solrj.SolrClient;
+import org.apache.solr.client.solrj.request.UpdateRequest;
+import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SolrInputDocument;
 
 import java.io.IOException;
+import java.net.ConnectException;
+import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -38,7 +45,7 @@ class IndexThreads {
   final Thread[] threads;
 
   public IndexThreads(SolrClient client, AtomicBoolean indexingFailed, LineFileDocs lineFileDocs, int numThreads, int docCountLimit,
-                      boolean printDPS, float docsPerSecPerThread, UpdatesListener updatesListener, int batchSize)
+                      boolean printDPS, float docsPerSecPerThread, UpdatesListener updatesListener, int batchSize, boolean overwrite)
           throws IOException, InterruptedException {
 
     this.docs = lineFileDocs;
@@ -51,7 +58,7 @@ class IndexThreads {
     failed = indexingFailed;
 
     for (int thread = 0; thread < numThreads; thread++) {
-      threads[thread] = new IndexThread(startLatch, stopLatch, client, docs, docCountLimit, count, stop, docsPerSecPerThread, failed, updatesListener, batchSize);
+      threads[thread] = new IndexThread(startLatch, stopLatch, client, docs, docCountLimit, count, stop, docsPerSecPerThread, failed, updatesListener, batchSize, overwrite);
       threads[thread].start();
     }
 
@@ -114,11 +121,12 @@ class IndexThreads {
     private final AtomicBoolean failed;
     private final UpdatesListener updatesListener;
     private final int batchSize;
+    private final boolean overwrite;
 
     public IndexThread(CountDownLatch startLatch, CountDownLatch stopLatch, SolrClient client,
                        LineFileDocs docs, int numTotalDocs, AtomicInteger count,
                        AtomicBoolean stop, float docsPerSec,
-                       AtomicBoolean failed, UpdatesListener updatesListener, int batchSize) {
+                       AtomicBoolean failed, UpdatesListener updatesListener, int batchSize, boolean overwrite) {
       this.startLatch = startLatch;
       this.stopLatch = stopLatch;
       this.client = client;
@@ -130,13 +138,14 @@ class IndexThreads {
       this.failed = failed;
       this.updatesListener = updatesListener;
       this.batchSize = batchSize;
+      this.overwrite = overwrite;
     }
 
     @Override
     public void run() {
       try {
         final LineFileDocs.DocState docState = docs.newDocState();
-        final long tStart = System.currentTimeMillis();
+        final long tStart = System.nanoTime();
 
         try {
           startLatch.await();
@@ -159,7 +168,7 @@ class IndexThreads {
             }
 
             if (((1 + id) % 100000) == 0) {
-              System.out.println("Indexer: " + (1 + id) + " docs... (" + (System.currentTimeMillis() - tStart) + " msec)");
+              System.out.println("Indexer: " + (1 + id) + " docs... (" + TimeUnit.MILLISECONDS.convert(System.nanoTime() - tStart, TimeUnit.NANOSECONDS) + " msec)");
             }
             if (updatesListener != null) {
               updatesListener.beforeUpdate();
@@ -173,7 +182,7 @@ class IndexThreads {
             threadCount++;
 
             if ((docCount % 100000) == 0) {
-              System.out.println("Indexer: " + docCount + " docs... (" + (System.currentTimeMillis() - tStart) + " msec)");
+              System.out.println("Indexer: " + docCount + " docs... (" + TimeUnit.MILLISECONDS.convert(System.nanoTime() - tStart, TimeUnit.NANOSECONDS) + " msec)");
             }
 
             final long sleepNS = startNS + (long) (1000000000 * (threadCount / docsPerSec)) - System.nanoTime();
@@ -184,51 +193,20 @@ class IndexThreads {
             }
           }
         } else {
-          outer:
-          while (!stop.get()) {
+          boolean finished = false;
+          UpdateRequest updateRequest = new UpdateRequest();
+          while (!stop.get() && !finished) {
             if (batchSize > 1)  {
-              List<SolrInputDocument> list = new ArrayList<SolrInputDocument>(batchSize);
-              for (int i=0; i<batchSize; i++) {
-                final SolrInputDocument doc = docs.nextDoc(docState);
-                if (doc == null) {
-                  if (!list.isEmpty())  {
-                    client.add(list);
-                  }
-                  break outer;
-                }
-//              Object id = doc.getFieldValue("id");
-//              if (doc.getFieldValue("body").toString().length() > 10922)  {
-//                System.out.println("Long body: id = " + id);
-//                i--;
-//                continue;
-//              }
-//              if (id.equals("00547r") || id.equals("03fetn") || id.equals("04n7lu") || id.equals("04z8uc")) {
-//                i--;
-//                continue;
-//              }
-                int docCount = count.incrementAndGet();
-                if (numTotalDocs != -1 && docCount > numTotalDocs) {
-                  break;
-                }
-                if ((docCount % 100000) == 0) {
-                  long timeSinceStart = System.currentTimeMillis() - tStart;
-                  System.out.format(Locale.ROOT, "Indexer: %d docs at %.2f sec (%.1f MB/sec %.1f docs/sec)\n",
-                          docCount, timeSinceStart/1000.,
-                          (docs.getBytesIndexed() / 1024. / 1024 / (timeSinceStart / 1000.)),
-                          (docCount / (timeSinceStart / 1000.)));
-                }
-                list.add(doc);
-              }
-
-              if (!list.isEmpty()) {
-                client.add(list);
-              }
+              finished = generateAndIndexBatch(docState, updateRequest, tStart);
+              updateRequest.clear();
             } else  {
               final SolrInputDocument doc = docs.nextDoc(docState);
               if (doc == null) {
                 break;
               }
-              client.add(doc);
+              updateRequest.add(doc, overwrite);
+              sendBatch(updateRequest, 10, 3);
+              updateRequest.clear();
             }
           }
         }
@@ -239,6 +217,69 @@ class IndexThreads {
         stopLatch.countDown();
       }
     }
+
+    /**
+     * @return true if all docs are over
+     * @throws Exception
+     */
+    private boolean generateAndIndexBatch(LineFileDocs.DocState docState, UpdateRequest reuseRequest, long tStart) throws Exception {
+      for (int i=0; i<batchSize; i++) {
+        final SolrInputDocument doc = docs.nextDoc(docState);
+        if (doc == null) {
+          reuseRequest.add(doc, overwrite);
+          sendBatch(reuseRequest, 10, 3);
+          return true;
+        }
+        int docCount = count.incrementAndGet();
+        if (numTotalDocs != -1 && docCount > numTotalDocs) {
+          break;
+        }
+        if ((docCount % 100000) == 0) {
+          long timeSinceStart = TimeUnit.MILLISECONDS.convert(System.nanoTime() - tStart, TimeUnit.NANOSECONDS);
+          System.out.format(Locale.ROOT, "Indexer: %d docs at %.2f sec (%.1f MB/sec %.1f docs/sec)\n",
+                  docCount, timeSinceStart/1000.,
+                  (docs.getBytesIndexed() / 1024. / 1024 / (timeSinceStart / 1000.)),
+                  (docCount / (timeSinceStart / 1000.)));
+        }
+        reuseRequest.add(doc, overwrite);
+      }
+      sendBatch(reuseRequest, 10, 3);
+      return false;
+    }
+
+    protected int sendBatch(UpdateRequest reuseRequest, int waitBeforeRetry, int maxRetries) {
+      int sent;
+      try {
+        client.request(reuseRequest);
+        sent = reuseRequest.getDocuments().size();
+      } catch (Exception exc) {
+        Throwable rootCause = SolrException.getRootCause(exc);
+        boolean wasCommError =
+                (rootCause instanceof ConnectException ||
+                        rootCause instanceof ConnectTimeoutException ||
+                        rootCause instanceof NoHttpResponseException ||
+                        rootCause instanceof SocketException);
+
+        if (wasCommError) {
+          if (--maxRetries > 0) {
+            System.out.println("ERROR: " + rootCause + " ... Sleeping for "
+                    + waitBeforeRetry + " seconds before re-try ...");
+            try {
+              Thread.sleep(waitBeforeRetry * 1000L);
+            } catch (InterruptedException e) {
+              throw new RuntimeException(e);
+            }
+            sent = sendBatch(reuseRequest, waitBeforeRetry, maxRetries);
+          } else {
+            throw new RuntimeException("No more retries available!", exc);
+          }
+        } else {
+          throw new RuntimeException(exc);
+        }
+      }
+      return sent;
+    }
+
   }
 
   private static class IngestRatePrinter extends Thread {

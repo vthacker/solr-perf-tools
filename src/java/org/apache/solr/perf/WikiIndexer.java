@@ -77,6 +77,12 @@ public final class WikiIndexer {
     // docs from the line file source:
     final boolean repeatDocs = args.getFlag("-repeatDocs");
 
+    //All docs are unique and we we don't want to do the overwrite check.
+    boolean overwrite = true;
+    if (args.hasArg("-overwrite")) {
+      overwrite = args.getBool("-overwrite");
+    }
+
     args.check();
 
     System.out.println("Line file: " + lineFile);
@@ -86,6 +92,7 @@ public final class WikiIndexer {
     System.out.println("Verbose: " + (verbose ? "yes" : "no"));
     System.out.println("Do deletions: " + (doDeletions ? "yes" : "no"));
     System.out.println("Repeat docs: " + repeatDocs);
+    System.out.println("Overwrite docs: " + overwrite);
 
     final AtomicBoolean indexingFailed = new AtomicBoolean();
 
@@ -112,7 +119,7 @@ public final class WikiIndexer {
 
       float docsPerSecPerThread = -1f;
 
-      IndexThreads threads = new IndexThreads(client, indexingFailed, lineFileDocs, numThreads, docCountLimit, printDPS, docsPerSecPerThread, null, batchSize);
+      IndexThreads threads = new IndexThreads(client, indexingFailed, lineFileDocs, numThreads, docCountLimit, printDPS, docsPerSecPerThread, null, batchSize, overwrite);
 
       System.out.println("\nIndexer: start");
       final long t0 = System.currentTimeMillis();

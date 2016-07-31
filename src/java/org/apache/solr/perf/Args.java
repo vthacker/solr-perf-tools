@@ -28,7 +28,7 @@ import java.util.Map;
  */
 public class Args {
   private final String[] args;
-  private final Map<String,Boolean> used = new HashMap<String,Boolean>();
+  private final Map<String,Boolean> used = new HashMap<>();
 
   public Args(String[] args) {
     this.args = args;
@@ -49,7 +49,7 @@ public class Args {
   }
 
   public List<String> getStrings(String argName) {
-    List<String> values = new ArrayList<String>();
+    List<String> values = new ArrayList<>();
     for(int upto=0;upto<args.length;upto++) {
       if (args[upto].equals(argName)) {
         if (upto == args.length-1) {
@@ -93,6 +93,10 @@ public class Args {
 
   public long getLong(String argName) {
     return Long.parseLong(getString(argName));
+  }
+
+  public boolean getBool(String argName) {
+    return Boolean.getBoolean(getString(argName));
   }
 
   public boolean getFlag(String argName) {
